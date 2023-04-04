@@ -7,15 +7,14 @@ from mindspore.common.initializer import TruncatedNormal, initializer
 from mindspore.ops import operations as P
 from mindspore.ops import functional as F
 from mindformers.modules.transformer.moe import default_moe_config
-from mindformers.modules.layers import LayerNorm, Dropout
 from mindformers.core.loss import CrossEntropyLoss
-from mindformers.modules.transformer import AttentionMask, TransformerEncoder, VocabEmbedding
+from mindformers.modules.transformer import AttentionMask, TransformerEncoder
 from mindformers.models.base_model import BaseModel
 from mindformers.tools.logger import logger
 from .configuration_bloom import BloomConfig
+from .layers import LayerNorm, VocabEmbedding
 
-
-class BloomEmbeddingLayer(nn.Cell):
+class BloomEmbeddingLayer(VocabEmbedding):
     r"""The Embedding Layer of GPT-2 network."""
     def __init__(self, config = None):
         super().__init__(auto_prefix=False)
@@ -78,9 +77,14 @@ class BloomModel(nn.Cell):
     def __init__(self, config):
         super().__init__()
 
-        self.embedding = BloomEmbeddingLayer(config)
-        self.embedding.pipeline_stage = 0
+        self.embedding = VocabEmbedding(vocab_size=config.vocab_size,
+                                        embedding_size=config.hidden_size,
+                                        param_init=initializer(TruncatedNormal(config.initializer_range),
+                                                                [config.vocab_size, config.hidden_size],
+                                                                dtype=mstype.float32),
+                                        parallel_config=config.parallel_config.embedding_dp_mp_config)
 
+        self.embedding.pipeline_stage = 0
 
         self.get_attention_mask = AttentionMask(seq_length=config.seq_length,
                                                 parallel_config=config.parallel_config.dp_mp_config)

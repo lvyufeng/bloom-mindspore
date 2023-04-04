@@ -3,7 +3,7 @@ from src.configuration_bloom import BloomConfig
 from src.modeling_bloom import BloomModel
 import re
 
-hf_bloom = AutoModel.from_pretrained('bigscience/bigscience-small-testing')
+hf_bloom = AutoModel.from_pretrained('bigscience/bloom-560m')
 
 print(hf_bloom.config)
 hf_weights = hf_bloom.state_dict()
