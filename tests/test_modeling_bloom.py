@@ -8,6 +8,8 @@ from transformers import AutoModel
 from src.configuration_bloom import BloomConfig
 from src.modeling_bloom import BloomModel
 
+# from mindspore import context
+# context.set_context(mode=context.PYNATIVE_MODE)
 
 def test_bloom_forward():
     config = BloomConfig(seq_length=20, vocab_size=2000)

@@ -1,6 +1,7 @@
 import copy
+import math
 import numpy as np
-import mindspore.nn as nn
+from mindspore import nn, ops
 import mindspore.common.dtype as mstype
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import TruncatedNormal, initializer
@@ -12,7 +13,60 @@ from mindformers.core.loss import CrossEntropyLoss
 from mindformers.modules.transformer import AttentionMask, TransformerEncoder, VocabEmbedding
 from mindformers.models.base_model import BaseModel
 from mindformers.tools.logger import logger
+from .layers import BloomBlocks
 from .configuration_bloom import BloomConfig
+
+class AlibiTensor(nn.Cell):
+    def __init__(self, seq_length, num_heads):
+        super().__init__()
+        self.seq_length = seq_length
+        self.num_heads = num_heads
+
+        # build slopes
+        closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+        base = np.array(2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))), dtype=np.float32)
+        powers = np.arange(1, 1 + closest_power_of_2, dtype=np.int32)
+        slopes = np.power(base, powers)
+
+        if closest_power_of_2 != num_heads:
+            extra_base = np.array(
+                2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))), dtype=np.float32
+            )
+            num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
+            extra_powers = np.arange(1, 1 + 2 * num_remaining_heads, 2, dtype=np.int32)
+            slopes = np.concatenate([slopes, np.power(extra_base, extra_powers)], axis=0)
+
+        self.slopes = Tensor(slopes)
+
+    def construct(self, attention_mask, dtype):
+        """
+        Link to paper: https://arxiv.org/abs/2108.12409 Alibi tensor is not causal as the original paper mentions, it
+        relies on a translation invariance of softmax for quick implementation: with l being a tensor, and a fixed value
+        `softmax(l+a) = softmax(l)`. Based on
+        https://github.com/ofirpress/attention_with_linear_biases/blob/a35aaca144e0eb6b789dfcb46784c4b8e31b7983/fairseq/models/transformer.py#L742
+        TODO @thomasw21 this doesn't work as nicely due to the masking strategy, and so masking varies slightly.
+
+        Args:
+        Returns tensor shaped (batch_size * num_heads, 1, max_seq_len)
+            attention_mask:
+                Token-wise attention mask, this should be of shape (batch_size, max_seq_len).
+            num_heads:
+                number of heads
+            dtype:
+                dtype of the output tensor
+        """
+        batch_size = attention_mask.shape[0]
+
+        # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
+        # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
+        # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
+        # => the query_length dimension will then be broadcasted correctly
+        # This is more or less identical to T5's relative position bias:
+        # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
+
+        arange_tensor = ((attention_mask.cumsum(axis=-1) - 1) * attention_mask)[:, None, :]
+        alibi = self.slopes[..., None] * arange_tensor
+        return alibi.reshape(batch_size * self.num_heads, 1, self.seq_length).astype(dtype)
 
 
 class BloomEmbeddingLayer(nn.Cell):
@@ -85,24 +139,26 @@ class BloomModel(nn.Cell):
         self.get_attention_mask = AttentionMask(seq_length=config.seq_length,
                                                 parallel_config=config.parallel_config.dp_mp_config)
 
+        self.get_alibi_tensor = AlibiTensor(seq_length=config.seq_length, num_heads=config.num_heads)
+
         if not hasattr(config.parallel_config, "moe_config"):
             config.parallel_config.moe_config = default_moe_config
         moe_config = config.parallel_config.moe_config
-        self.blocks = TransformerEncoder(hidden_size=config.hidden_size,
-                                         batch_size=config.batch_size,
-                                         ffn_hidden_size=config.hidden_size * config.expand_ratio,
-                                         seq_length=config.seq_length,
-                                         num_layers=config.num_layers,
-                                         num_heads=config.num_heads,
-                                         attention_dropout_rate=config.attention_probs_dropout_prob,
-                                         hidden_dropout_rate=config.hidden_dropout_prob,
-                                         hidden_act=config.hidden_act,
-                                         lambda_func=set_parallel_configure_for_layer,
-                                         param_init_type=config.param_init_type,
-                                         layernorm_compute_type=config.layernorm_dtype,
-                                         softmax_compute_type=config.softmax_dtype,
-                                         parallel_config=config.parallel_config,
-                                         moe_config=moe_config).blocks
+        self.blocks = BloomBlocks(hidden_size=config.hidden_size,
+                                batch_size=config.batch_size,
+                                ffn_hidden_size=config.hidden_size * config.expand_ratio,
+                                seq_length=config.seq_length,
+                                num_layers=config.num_layers,
+                                num_heads=config.num_heads,
+                                attention_dropout_rate=config.attention_probs_dropout_prob,
+                                hidden_dropout_rate=config.hidden_dropout_prob,
+                                hidden_act=config.hidden_act,
+                                lambda_func=set_parallel_configure_for_layer,
+                                param_init_type=config.param_init_type,
+                                layernorm_compute_type=config.layernorm_dtype,
+                                softmax_compute_type=config.softmax_dtype,
+                                parallel_config=config.parallel_config,
+                                moe_config=moe_config).blocks
         self.cast = P.Cast()
         self.tile = P.Tile().shard(((config.parallel_config.data_parallel,),))
         self.dtype = mstype.float16
@@ -126,9 +182,10 @@ class BloomModel(nn.Cell):
         hidden_states = self.cast(input_embedding, self.dtype)
 
         attention_mask = self.get_attention_mask(input_mask)
+        alibi_tensor = self.get_alibi_tensor(input_mask, self.dtype)
 
         for i in range(self.num_layers):
-            hidden_states, _ = self.blocks[i](hidden_states, attention_mask)
+            hidden_states, _ = self.blocks[i](hidden_states, alibi_tensor, attention_mask)
 
         output_state = self.ln_f(hidden_states)
 
