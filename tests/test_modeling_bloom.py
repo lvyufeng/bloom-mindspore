@@ -7,6 +7,7 @@ from transformers import AutoModel
 
 from src.configuration_bloom import BloomConfig
 from src.modeling_bloom import BloomModel
+from src.mapping import hf_to_ms
 
 # from mindspore import context
 # context.set_context(mode=context.PYNATIVE_MODE)
@@ -57,3 +58,46 @@ def test_hf_bloom_fp16_560m():
           outputs_fp16_last_hidden_state) > 5e-3).sum()
     total = outputs.last_hidden_state.numel()
     print(total, error_count_1e_minus_3, error_count_5e_minus_3)
+
+
+def test_bloom_hf_precision_small_test():
+    hf_bloom = AutoModel.from_pretrained('bigscience/bigscience-small-testing')
+    hf_bloom.eval()
+    # convert hf ckpt to ms
+    print(hf_bloom.config)
+    hf_weights = hf_bloom.state_dict()
+
+    ms_params = hf_to_ms(hf_weights)
+    ms_config = BloomConfig(hidden_size=64, num_heads=8, num_layers=2, seq_length=20)
+    ms_bloom = BloomModel(ms_config)
+    ms_bloom.set_train(False)
+
+    not_loaded = mindspore.load_param_into_net(ms_bloom, ms_params)
+    print(not_loaded)
+
+    input_ids = np.random.randint(0, 2000, (1, 20))
+    input_mask = np.ones((1, 20))
+
+    input_ids_ms = Tensor(input_ids, mindspore.int32)
+    input_mask_ms = Tensor(input_mask, mindspore.float32)
+
+    input_ids_pt = torch.tensor(input_ids, dtype=torch.int32)
+    input_mask_pt = torch.tensor(input_mask, dtype=torch.float32)
+
+    outputs_ms = ms_bloom(input_ids_ms, input_mask_ms)
+    outputs_hf = hf_bloom(input_ids_pt, attention_mask=input_mask_pt)
+
+    hidden_hf = outputs_hf.last_hidden_state.detach().numpy()
+    hidden_ms = outputs_ms[0].asnumpy()
+
+    total = outputs_hf.last_hidden_state.numel()
+    error_count_1e_minus_3 = ((hidden_hf - \
+          hidden_ms) > 1e-3).sum()
+    error_count_5e_minus_3 = ((hidden_hf - \
+          hidden_ms) > 5e-3).sum()
+    print(total, error_count_1e_minus_3, error_count_5e_minus_3)
+
+    assert np.allclose(outputs_ms[0].asnumpy(),
+                       outputs_hf.last_hidden_state.detach().numpy(),
+                       5e-3, 5e-3
+                       )
