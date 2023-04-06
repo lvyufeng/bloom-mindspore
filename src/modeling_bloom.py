@@ -63,10 +63,9 @@ class AlibiTensor(nn.Cell):
         # => the query_length dimension will then be broadcasted correctly
         # This is more or less identical to T5's relative position bias:
         # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
-
         arange_tensor = ((attention_mask.cumsum(axis=-1) - 1) * attention_mask)[:, None, :]
         alibi = self.slopes[..., None] * arange_tensor
-        return alibi.reshape(batch_size * self.num_heads, 1, self.seq_length).astype(dtype)
+        return alibi.reshape(batch_size, self.num_heads, 1, self.seq_length).astype(dtype)
 
 
 class BloomEmbeddingLayer(nn.Cell):
@@ -182,6 +181,7 @@ class BloomModel(nn.Cell):
         hidden_states = self.cast(input_embedding, self.dtype)
 
         attention_mask = self.get_attention_mask(input_mask)
+
         alibi_tensor = self.get_alibi_tensor(input_mask, self.dtype)
 
         for i in range(self.num_layers):

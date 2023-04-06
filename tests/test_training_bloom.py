@@ -16,7 +16,7 @@ from src.modeling_bloom import BloomLMHeadModel, BloomConfig
 
 def generator():
     """dataset generator"""
-    seq_len = 1025
+    seq_len = 21
     input_ids = np.random.randint(low=0, high=15, size=(seq_len,)).astype(np.int32)
     input_mask = np.ones_like(input_ids)
     label_ids = input_ids
@@ -34,8 +34,10 @@ def test_gpt_trainer_train_from_instance():
     runner_config = RunnerConfig(epochs=1, batch_size=8, sink_mode=True, per_epoch_size=2)
     config = ConfigArguments(seed=2022, runner_config=runner_config)
 
+    ms_config = BloomConfig(hidden_size=64, num_heads=8, num_layers=2, seq_length=20)
+
     # Model
-    gpt_model = BloomLMHeadModel()
+    gpt_model = BloomLMHeadModel(ms_config)
 
     # Dataset and operations
     dataset = GeneratorDataset(generator, column_names=["input_ids"])
