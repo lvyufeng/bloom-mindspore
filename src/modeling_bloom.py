@@ -36,7 +36,7 @@ class AlibiTensor(nn.Cell):
             extra_powers = np.arange(1, 1 + 2 * num_remaining_heads, 2, dtype=np.int32)
             slopes = np.concatenate([slopes, np.power(extra_base, extra_powers)], axis=0)
 
-        self.slopes = Tensor(slopes)
+        self.slopes = Tensor(slopes, mstype.float32)
 
     def construct(self, attention_mask, dtype):
         """
