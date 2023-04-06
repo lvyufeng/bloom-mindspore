@@ -14,6 +14,9 @@ from mindformers.core.optim import FusedAdamWeightDecay
 from mindformers.pipeline import pipeline
 from src.modeling_bloom import BloomLMHeadModel, BloomConfig
 
+import mindspore
+mindspore.set_context(mode=mindspore.GRAPH_MODE)
+
 def generator():
     """dataset generator"""
     seq_len = 21
@@ -22,7 +25,7 @@ def generator():
     label_ids = input_ids
     train_data = (input_ids, input_mask, label_ids)
     for _ in range(512):
-        yield train_data[0]
+        yield (train_data[0],)
 
 def test_gpt_trainer_train_from_instance():
     """
