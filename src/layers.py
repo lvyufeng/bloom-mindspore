@@ -102,7 +102,7 @@ class BloomAttention(Cell):
             # Normalize factor for attention, sqrt(dk) as widely used
             self.scale_factor = Tensor(math.sqrt(math.sqrt(self.size_per_head)))
             self.inv_norm_factor = Tensor(1.0 / math.sqrt(self.size_per_head))
-            self.beta = 1.0
+            self.beta = Tensor(1.0)
             self.use_past = use_past
             self.dropout = nn.Dropout(1 - hidden_dropout_rate)
             self.prob_dropout = nn.Dropout(1 - attention_dropout_rate)
@@ -205,7 +205,7 @@ class BloomAttention(Cell):
             # Normalize factor for attention, sqrt(dk) as widely used
             self.scale_factor = Tensor(math.sqrt(math.sqrt(self.size_per_head)))
             self.inv_norm_factor = Tensor(1.0 / math.sqrt(self.size_per_head))
-            self.beta = 1.0
+            self.beta = Tensor(1.0)
             self.use_past = use_past
             self.dropout = nn.Dropout(1 - hidden_dropout_rate)
             self.prob_dropout = nn.Dropout(1 - attention_dropout_rate)
@@ -464,7 +464,7 @@ class BloomAttention(Cell):
         ori_dtype = score.dtype
         score = self.add(
             self.mul(score, self.inv_norm_factor.astype(ori_dtype)),
-            self.mul(alibi_tensor, F.scalar_to_array(self.beta).astype(ori_dtype))
+            self.mul(alibi_tensor, self.beta.astype(ori_dtype))
             )
         attention_scores = score.astype(self.softmax_dtype)
 
