@@ -16,17 +16,16 @@ except ImportError:
 from mindspore import log as logger
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 from mindspore.context import ParallelMode
-from mindformers.modules.layers import LayerNorm, Linear, \
+from mindformers.modules.layers import LayerNorm, \
     _check_past_none_input_none, _check_input_dtype
 from mindformers.modules.transformer.op_parallel_config import default_dpmp_config, _PipeLineConfig, OpParallelConfig, \
     _Config, _check_config, MoEParallelConfig
 from mindformers.modules.transformer.moe import default_moe_config, MoE, _check_moe_config
 
-from mindformers.tools.logger import _LogActionOnce
-from mindformers.tools.utils import is_version_ge
 from mindformers.modules.transformer import FeedForward
 from mindformers.modules.transformer.transformer import default_transformer_config, _get_lambda_func
-
+from .nn import Linear, Dropout
+# from .nn import Dropout
 
 class BloomAttention(Cell):
     def __init__(self, batch_size,
@@ -100,8 +99,8 @@ class BloomAttention(Cell):
             self.inv_norm_factor = Tensor(1.0 / math.sqrt(self.size_per_head))
             self.beta = Tensor(1.0)
             self.use_past = use_past
-            self.dropout = nn.Dropout(1 - hidden_dropout_rate)
-            self.prob_dropout = nn.Dropout(1 - attention_dropout_rate)
+            self.dropout = Dropout(hidden_dropout_rate)
+            self.prob_dropout = Dropout(attention_dropout_rate)
             self.softmax = nn.Softmax().to_float(softmax_compute_type)
             self.softmax_3d = nn.Softmax().to_float(softmax_compute_type)
             self.expand_dims = P.ExpandDims()
@@ -202,11 +201,12 @@ class BloomAttention(Cell):
             self.inv_norm_factor = Tensor(1.0 / math.sqrt(self.size_per_head))
             self.beta = Tensor(1.0)
             self.use_past = use_past
-            self.dropout = nn.Dropout(1 - hidden_dropout_rate)
-            self.prob_dropout = nn.Dropout(1 - attention_dropout_rate)
-            self.dropout.dropout.shard(((parallel_config.data_parallel, 1),))
-            self.prob_dropout.dropout.shard(
-                ((parallel_config.data_parallel, parallel_config.model_parallel, 1, 1),))
+            self.dropout = Dropout(hidden_dropout_rate)
+            self.prob_dropout = Dropout(attention_dropout_rate)
+
+            self.dropout.shard(((parallel_config.data_parallel, 1),))
+            self.prob_dropout.shard(((parallel_config.data_parallel, parallel_config.model_parallel, 1, 1),))
+
             self.softmax = nn.Softmax().to_float(softmax_compute_type)
             self.softmax.softmax.shard(((parallel_config.data_parallel, parallel_config.model_parallel, 1, 1),))
             self.softmax_3d = nn.Softmax().to_float(softmax_compute_type)
@@ -218,6 +218,7 @@ class BloomAttention(Cell):
                                  hidden_size,
                                  compute_dtype=compute_dtype,
                                  param_init_type=param_init_type)
+
             self.dense1.shard(strategy_matmul=((parallel_config.data_parallel, 1), (parallel_config.model_parallel, 1)),
                               strategy_bias=((parallel_config.data_parallel, parallel_config.model_parallel),
                                              (parallel_config.model_parallel,)))
@@ -226,6 +227,7 @@ class BloomAttention(Cell):
                                  hidden_size,
                                  compute_dtype=compute_dtype,
                                  param_init_type=param_init_type)
+
             self.dense2.shard(strategy_matmul=((parallel_config.data_parallel, 1), (parallel_config.model_parallel, 1)),
                               strategy_bias=((parallel_config.data_parallel, parallel_config.model_parallel),
                                              (parallel_config.model_parallel,)))
@@ -238,6 +240,7 @@ class BloomAttention(Cell):
             self.dense3.shard(strategy_matmul=((parallel_config.data_parallel, 1), (parallel_config.model_parallel, 1)),
                               strategy_bias=((parallel_config.data_parallel, parallel_config.model_parallel),
                                              (parallel_config.model_parallel,)))
+
             self.dtype = compute_dtype
             self.softmax_dtype = softmax_compute_type
             if self.use_past:
@@ -269,9 +272,9 @@ class BloomAttention(Cell):
                                                                             key_tensor,
                                                                             value_tensor)
         ori_dtype = query_tensor.dtype
-        query_tensor = query_tensor.astype(self.dtype)
-        key_tensor = key_tensor.astype(self.dtype)
-        value_tensor = value_tensor.astype(self.dtype)
+        # query_tensor = query_tensor.astype(self.dtype)
+        # key_tensor = key_tensor.astype(self.dtype)
+        # value_tensor = value_tensor.astype(self.dtype)
         # multi head attention: query, key, value are derived from the same inputs
         query = self.dense1(query_tensor)
         key = self.dense2(key_tensor)
@@ -281,11 +284,13 @@ class BloomAttention(Cell):
             query.reshape((batch_size, self._get_seq_length_under_incremental(self.src_seq_length),
                  self.n_head, self.size_per_head)),
             (0, 2, 1, 3))
-        # the returned shape is [bs, size_per_head, seq_length, num_heads]
+        # return query, query
+        # the returned shape is [bs, num_heads, size_per_head, seq_length]
         key = self.transpose(
             key.reshape((batch_size, self._get_seq_length_under_incremental(self.tgt_seq_length),
                         self.n_head, self.size_per_head)),
             (0, 2, 3, 1))
+
         # the returned shape is [bs, num_heads, seq_length, size_per_head]
         value = self.transpose(
             value.reshape((batch_size, self._get_seq_length_under_incremental(self.tgt_seq_length),
@@ -336,6 +341,7 @@ class BloomAttention(Cell):
         # multi head attention considering attention mask
         # the return shape is [bs * seq_length, hidden_size]
         attention = self._attn(query, key, value, alibi_tensor, attention_mask)
+
         # Output
         output = self.projection(attention)
         output = self.dropout(output)
@@ -446,17 +452,14 @@ class BloomAttention(Cell):
         """
         # Normalize query and key before MatMul, default off
         # Attention score [bs, num_heads, seq_length, seq_length]
-        factor = self.scale_factor.astype(query.dtype)
-        query = self.real_div(query, factor)
-        key = self.real_div(key, factor)
-        score = self.batch_matmul(query, key)
-        ori_dtype = score.dtype
+        ori_dtype = query.dtype
+        score = self.batch_matmul(query.astype(self.dtype), key.astype(self.dtype))
+        score = score.astype(ori_dtype)
         score = self.add(
             self.mul(score, self.inv_norm_factor.astype(ori_dtype)),
             self.mul(alibi_tensor, self.beta.astype(ori_dtype))
             )
         attention_scores = score.astype(self.softmax_dtype)
-
         # for input size of (bs, 1) namely the second graph,
         # the shape of attention_mask matrix should be (bs, 1, 1, seq_length)
         if attention_mask is not None:
@@ -487,10 +490,12 @@ class BloomAttention(Cell):
 
         attention_probs = self.prob_dropout(attention_probs)
         # Weighted sum output [bs, num_heads, seq_length, size_per_head]
-        weighted_values = self.batch_matmul(attention_probs, value)
+
+        weighted_values = self.batch_matmul(attention_probs.astype(self.dtype),
+                                            value.astype(self.dtype))
+        weighted_values = weighted_values.astype(self.softmax_dtype)
         attention_merge = self._merge_heads(weighted_values)
         return attention_merge
-
 
 
 class BloomBlock(Cell):
@@ -679,8 +684,9 @@ class BloomBlock(Cell):
             input_x = x
         else:
             input_x = self.layernorm1(x)
-        input_x = input_x.astype(self.dtype)
 
+
+        # input_x = input_x.astype(self.dtype)
         # indicate whether reset saved states
         key_reset = None
         value_reset = None
@@ -705,7 +711,9 @@ class BloomBlock(Cell):
             x = self.add(x, attention)
 
         output_x = self.layernorm2(x)
-        output_x = output_x.astype(self.dtype)
+        # return (output_x, output_x)
+
+        # output_x = output_x.astype(self.dtype)
         aux_loss = None
         if self.use_moe:
             mlp_logit, aux_loss = self.output(output_x)
@@ -871,17 +879,6 @@ class BloomBlocks(Cell):
     def construct(self, hidden_states, alibi_tensor, attention_mask, init_reset=True, batch_valid_length=None):
         """forward process"""
         present_layer = ()
-        if self.use_moe:
-            accum_loss = self.aux_loss
-            for i in range(self.num_layers):
-                hidden_states, present, aux_loss = self.blocks[i](hidden_states,
-                                                                  attention_mask,
-                                                                  init_reset,
-                                                                  batch_valid_length)
-                present_layer = present_layer + (present,)
-                accum_loss = self.add(accum_loss, aux_loss)
-            return hidden_states, present_layer, accum_loss
-
         for i in range(self.num_layers):
             hidden_states, present = self.blocks[i](hidden_states,
                                                     alibi_tensor,
@@ -891,3 +888,71 @@ class BloomBlocks(Cell):
             present_layer = present_layer + (present,)
 
         return hidden_states, present_layer
+
+
+class CausalMask(nn.Cell):
+    r"""
+        Get the Lower triangular matrix from the input mask. The input mask is a 2D tensor (batch_size, seq_length)
+        with 1 and 0, where 1 indicates the current position is a valid token, otherwise not.
+
+        Args:
+            seq_length(int): The sequence length of the input tensor.
+            parallel_config(OpParallelConfig): The parallel configure. Default `default_dpmp_config`,
+                                               an instance of `OpParallelConfig` with default args.
+
+        Inputs:
+            - **input_mask** (Tensor) - The mask indicating whether each position is a valid input with
+              (batch_size, seq_length).
+
+        Outputs:
+            Tensor. The attention mask matrix with shape (batch_size, seq_length, seq_length).
+
+        Raises:
+            TypeError: `seq_length` is not an integer.
+            ValueError: `seq_length` is not a positive value.
+            TypeError: `parallel_config` is not a subclass of OpParallelConfig.
+
+        Supported Platforms:
+            ``Ascend`` ``GPU``
+
+        Examples:
+            >>> import numpy as np
+            >>> from mindformers.modules.transformer import AttentionMask
+            >>> from mindspore import Tensor
+            >>> mask = AttentionMask(seq_length=4)
+            >>> mask_array = np.array([[1, 1, 1, 0]], np.float32)
+            >>> inputs = Tensor(mask_array)
+            >>> res = mask(inputs)
+            >>> print(res)
+            [[[1. 0. 0. 0]
+              [1. 1. 0. 0]
+              [1. 1. 1. 0]
+              [0. 0. 0. 0]]]
+    """
+
+    def __init__(self, seq_length, parallel_config=default_dpmp_config):
+        super().__init__()
+        self.seq_length = seq_length
+        self.not_equal = P.NotEqual().shard(((parallel_config.data_parallel, 1), ()))
+        self.mul = P.BatchMatMul().shard(
+            ((parallel_config.data_parallel, 1, 1), (parallel_config.data_parallel, 1, 1)))
+        self.expand_dim = P.ExpandDims().shard(((1, 1),))
+        # Default lower triangle mask matrix
+        self.lower_triangle_mask = Tensor(np.tril(np.ones(shape=(seq_length, seq_length))), mstype.float32)
+        self.multiply = P.Mul().shard(((parallel_config.data_parallel, 1, 1), (1, 1, 1)))
+
+    def construct(self, input_mask):
+        """Forward process of the AttentionMask"""
+        input_mask = self.not_equal(input_mask, 0).astype(mstype.float32)
+        input_shape = input_mask.shape
+        shape_right = (input_shape[0], 1, input_shape[1])
+        shape_left = input_shape + (1,)
+        # Mask the padded inputs
+        mask_left = input_mask.reshape(shape_left)
+        mask_right = input_mask.reshape(shape_right)
+        attention_mask = self.mul(mask_left, mask_right)
+        lower_traiangle = self.expand_dim(self.lower_triangle_mask, 0)
+        # the returned shape is [bs, seq_length, seq_length]
+        attention_mask = self.multiply(
+            attention_mask, lower_traiangle)
+        return attention_mask

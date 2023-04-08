@@ -10,10 +10,10 @@ from mindspore.ops import functional as F
 from mindformers.modules.transformer.moe import default_moe_config
 from mindformers.modules.layers import LayerNorm, Dropout
 from mindformers.core.loss import CrossEntropyLoss
-from mindformers.modules.transformer import AttentionMask, TransformerEncoder, VocabEmbedding
 from mindformers.models.base_model import BaseModel
 from mindformers.tools.logger import logger
-from .layers import BloomBlocks
+from .nn import Embedding
+from .layers import BloomBlocks, CausalMask
 from .configuration_bloom import BloomConfig
 
 class AlibiTensor(nn.Cell):
@@ -81,12 +81,24 @@ class BloomEmbeddingLayer(nn.Cell):
             logger.warning("Now, model_parallel will be changed: mp = 1")
             parallel_config.embedding_dp_mp_config.model_parallel = 1
 
-        self.word_embeddings = VocabEmbedding(vocab_size=vocab_size,
-                                              embedding_size=config.hidden_size,
-                                              param_init=initializer(TruncatedNormal(config.initializer_range),
-                                                                     [vocab_size, config.hidden_size],
-                                                                     dtype=mstype.float32),
-                                              parallel_config=parallel_config.embedding_dp_mp_config)
+        self.word_embeddings = Embedding(vocab_size=vocab_size,
+                                         embedding_size=config.hidden_size,
+                                         param_init=initializer(TruncatedNormal(config.initializer_range),
+                                                                [vocab_size, config.hidden_size],
+                                                                dtype=mstype.float32))
+
+        if parallel_config.vocab_emb_dp:
+            self.word_embeddings.shard(((1, 1), (parallel_config.data_parallel, 1)))
+            logger.info(f"Using {parallel_config.data_parallel} data parallel for the embedding lookup.")
+        else:
+            if vocab_size % parallel_config.model_parallel != 0:
+                raise ValueError(f"The vocab size of the embedding {self.vocab_size} must be a "
+                                 f"multiple of parallel_config.model_parallel {parallel_config.model_parallel}.")
+            self.word_embeddings.shard(((parallel_config.model_parallel, 1), (parallel_config.data_parallel, 1)))
+            logger.info(f"Using {parallel_config.data_parallel} data parallel and {parallel_config.model_parallel} "
+                        f"model parallel for the embedding lookup.")
+
+
         new_parallel_config = copy.deepcopy(parallel_config)
         new_parallel_config.vocab_emb_dp = True
 
@@ -135,14 +147,11 @@ class BloomModel(nn.Cell):
         self.embedding.pipeline_stage = 0
 
 
-        self.get_attention_mask = AttentionMask(seq_length=config.seq_length,
+        self.make_causal_attention = CausalMask(seq_length=config.seq_length,
                                                 parallel_config=config.parallel_config.dp_mp_config)
 
-        self.get_alibi_tensor = AlibiTensor(seq_length=config.seq_length, num_heads=config.num_heads)
+        self.build_alibi_tensor = AlibiTensor(seq_length=config.seq_length, num_heads=config.num_heads)
 
-        if not hasattr(config.parallel_config, "moe_config"):
-            config.parallel_config.moe_config = default_moe_config
-        moe_config = config.parallel_config.moe_config
         self.blocks = BloomBlocks(hidden_size=config.hidden_size,
                                 batch_size=config.batch_size,
                                 ffn_hidden_size=config.hidden_size * config.expand_ratio,
@@ -156,14 +165,11 @@ class BloomModel(nn.Cell):
                                 param_init_type=config.param_init_type,
                                 layernorm_compute_type=config.layernorm_dtype,
                                 softmax_compute_type=config.softmax_dtype,
-                                parallel_config=config.parallel_config,
-                                moe_config=moe_config).blocks
+                                parallel_config=config.parallel_config).blocks
         self.cast = P.Cast()
         self.tile = P.Tile().shard(((config.parallel_config.data_parallel,),))
-        self.dtype = mstype.float16
         self.num_layers = config.num_layers
         self.input_position = Tensor(np.arange(config.seq_length), mstype.int32)
-
         self.ln_f = LayerNorm((config.hidden_size,)).to_float(config.layernorm_dtype)
         if config.parallel_config.pipeline_stage > 1:
             self.ln_f.set_comm_fusion(2)
@@ -177,16 +183,15 @@ class BloomModel(nn.Cell):
         """GPT model"""
 
         input_embedding, embedding_table = self.embedding(input_ids)
-
-        hidden_states = self.cast(input_embedding, self.dtype)
-
-        attention_mask = self.get_attention_mask(input_mask)
-
-        alibi_tensor = self.get_alibi_tensor(input_mask, self.dtype)
+        hidden_states = input_embedding
+        # get 
+        causal_mask = self.make_causal_attention(input_mask)
+        alibi_tensor = self.build_alibi_tensor(input_mask, hidden_states.dtype)
 
         for i in range(self.num_layers):
-            hidden_states, _ = self.blocks[i](hidden_states, alibi_tensor, attention_mask)
-
+            hidden_states, _ = self.blocks[i](hidden_states, alibi_tensor, causal_mask)
+        #     break
+        # return (hidden_states, hidden_states)
         output_state = self.ln_f(hidden_states)
 
         return output_state, embedding_table
