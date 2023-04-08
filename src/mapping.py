@@ -43,17 +43,30 @@ def layer_name_mapping(key):
         split = True
     return split, f"blocks.{layer_number}." + layer_rename_map[text]
 
-def hf_to_ms(hf_weights):
+def hf_to_ms(hf_weights, config):
     ms_params = {}
     for k, v in hf_weights.items():
         print(k, v.shape, v.dtype)
         split, new_name = layer_name_mapping(k)
         if split:
-            v_list = v.tensor_split(3)
-            for i in range(1, 4):
-                tmp_name = new_name.format(i)
-                tmp_tensor = Tensor(v_list[i-1].numpy(), mindspore.float32)
-                ms_params[tmp_name] = Parameter(tmp_tensor, name=tmp_name)
+            if 'weight' in new_name:
+                v = v.reshape(config.n_head, 3, config.hidden_size // config.n_head, v.shape[-1])
+                v_list = v.tensor_split(3, dim=1)
+                for i in range(1, 4):
+                    tmp_name = new_name.format(i)
+                    print(v_list[i-1].shape)
+                    tmp_tensor = Tensor(v_list[i-1].reshape(-1, v_list[i-1].shape[-1]).numpy(), mindspore.float32)
+                    ms_params[tmp_name] = Parameter(tmp_tensor, name=tmp_name)
+            else:
+                v = v.reshape(config.n_head, 3, config.hidden_size // config.n_head)
+                v_list = v.tensor_split(3, dim=1)
+                for i in range(1, 4):
+                    tmp_name = new_name.format(i)
+                    print(v_list[i-1].shape)
+                    tmp_tensor = Tensor(v_list[i-1].reshape(-1).numpy(), mindspore.float32)
+                    # if 'weight' in new_name:
+                    #     tmp_tensor = tmp_tensor.swapaxes(0, 1)
+                    ms_params[tmp_name] = Parameter(tmp_tensor, name=tmp_name)
         else:
             if ('projection' in new_name or 'mapping' in new_name) and 'weight' in new_name:
                 new_tensor = Tensor(v.transpose(0, 1).numpy(), mindspore.float32)
@@ -72,7 +85,7 @@ if __name__ == '__main__':
     print(hf_bloom.config)
     hf_weights = hf_bloom.state_dict()
 
-    ms_params = hf_to_ms(hf_weights)
+    ms_params = hf_to_ms(hf_weights, hf_bloom.config)
     ms_config = BloomConfig(hidden_size=64, num_heads=8, num_layers=2, seq_length=20)
     ms_bloom = BloomModel(ms_config)
 
