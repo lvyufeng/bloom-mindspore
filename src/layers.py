@@ -3,13 +3,11 @@ import numpy as np
 
 from mindspore.common.tensor import Tensor
 from mindspore.common.parameter import Parameter
-from mindspore.common.initializer import initializer
-from mindspore import nn
+from mindspore import nn, ops
 from mindspore import context
-import mindspore
 import mindspore.common.dtype as mstype
 from mindspore.ops import operations as P
-from mindspore.ops import functional as F
+# from mindspore.ops import functional as F
 from mindspore.nn.cell import Cell
 try:
     from mindspore._checkparam import Validator
@@ -19,7 +17,6 @@ from mindspore import log as logger
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 from mindspore.context import ParallelMode
 from mindformers.modules.layers import LayerNorm, Linear, \
-    _args_type_validator_check, _valid_type_checks, _valid_value_checks, \
     _check_past_none_input_none, _check_input_dtype
 from mindformers.modules.transformer.op_parallel_config import default_dpmp_config, _PipeLineConfig, OpParallelConfig, \
     _Config, _check_config, MoEParallelConfig
@@ -85,7 +82,6 @@ class BloomAttention(Cell):
             self.projection.bias.parallel_optimizer = False
             self.transpose = P.Transpose()
             self.merger_head_transpose = P.Transpose()
-            self.reshape = P.Reshape()
             self.n_head = num_heads
             # embedding size per head
             self.size_per_head = hidden_size // self.n_head
@@ -181,7 +177,6 @@ class BloomAttention(Cell):
                 ((parallel_config.data_parallel, 1, parallel_config.model_parallel, 1),))
             self.merger_head_transpose = P.Transpose().shard(
                 ((parallel_config.data_parallel, parallel_config.model_parallel, 1, 1),))
-            self.reshape = P.Reshape()
             self.n_head = num_heads
             # embedding size per head
             self.size_per_head = hidden_size // self.n_head
@@ -268,41 +263,36 @@ class BloomAttention(Cell):
         """Forward process of the MultiHeadAttention"""
         self._check_inputs(query_tensor, key_tensor, value_tensor, attention_mask, key_past,
                            value_past, batch_valid_length)
-        ori_shape = F.shape(query_tensor)
+        ori_shape = query_tensor.shape
         batch_size = self._get_batch_size_from_query(query_tensor)
         query_tensor, key_tensor, value_tensor = self._convert_to_2d_tensor(query_tensor,
                                                                             key_tensor,
                                                                             value_tensor)
-        ori_dtype = F.dtype(query_tensor)
-        query_tensor = F.cast(query_tensor, self.dtype)
-        key_tensor = F.cast(key_tensor, self.dtype)
-        value_tensor = F.cast(value_tensor, self.dtype)
+        ori_dtype = query_tensor.dtype
+        query_tensor = query_tensor.astype(self.dtype)
+        key_tensor = key_tensor.astype(self.dtype)
+        value_tensor = value_tensor.astype(self.dtype)
         # multi head attention: query, key, value are derived from the same inputs
         query = self.dense1(query_tensor)
         key = self.dense2(key_tensor)
         value = self.dense3(value_tensor)
         # the returned shape is [bs, num_heads, seq_length, size_per_head]
         query = self.transpose(
-            F.reshape(
-                query,
-                (batch_size, self._get_seq_length_under_incremental(self.src_seq_length),
+            query.reshape((batch_size, self._get_seq_length_under_incremental(self.src_seq_length),
                  self.n_head, self.size_per_head)),
             (0, 2, 1, 3))
         # the returned shape is [bs, size_per_head, seq_length, num_heads]
         key = self.transpose(
-            F.reshape(
-                key, (batch_size, self._get_seq_length_under_incremental(self.tgt_seq_length),
-                      self.n_head, self.size_per_head)),
+            key.reshape((batch_size, self._get_seq_length_under_incremental(self.tgt_seq_length),
+                        self.n_head, self.size_per_head)),
             (0, 2, 3, 1))
         # the returned shape is [bs, num_heads, seq_length, size_per_head]
         value = self.transpose(
-            F.reshape(
-                value,
-                (batch_size, self._get_seq_length_under_incremental(self.tgt_seq_length),
+            value.reshape((batch_size, self._get_seq_length_under_incremental(self.tgt_seq_length),
                  self.n_head, self.size_per_head)),
             (0, 2, 1, 3))
         # support input shape is [bs, seq, seq] or [bs, heads, seq, seq]
-        if attention_mask is not None and len(F.shape(attention_mask)) == 3:
+        if attention_mask is not None and attention_mask.ndim == 3:
             # expand attention mask from [bs, seq, seq] -> [bs, 1, seq, seq]
             attention_mask = self.expand_dims(attention_mask, 1)
         # key and value for current token(s)
@@ -312,7 +302,7 @@ class BloomAttention(Cell):
             # The first graph with the input size of (bs, seq_length)
             if self.is_first_iteration:
                 # Get the valid input length without padding
-                valid_length_vector = F.cast(self.less(self.range, batch_valid_length.view(-1, 1, 1)), self.dtype)
+                valid_length_vector = (self.less(self.range, batch_valid_length.view(-1, 1, 1))).astype(self.dtype)
                 # Cover the key and value numbers corresponding to the padding position
                 key_present = self.mul1(key, self.expand_dims(valid_length_vector, 2))
                 value_present = self.mul1(value, self.expand_dims(valid_length_vector, 3))
@@ -322,13 +312,13 @@ class BloomAttention(Cell):
             # the shape of value is (bs, num_heads, 1, size_per_head)
             else:
                 # Get the current token position index
-                valid_length = self.reducesum(F.cast(self.not_equal(self.slice(key_past, (0, 0, 0, 0),
-                                                                               (F.shape(key_tensor)[0], 1, 1,
+                valid_length = self.reducesum((self.not_equal(self.slice(key_past, (0, 0, 0, 0),
+                                                                               (key_tensor.shape[0], 1, 1,
                                                                                 self.src_seq_length),
                                                                                (1, 1, 1, 1)),
-                                                                    0), mstype.float32), (1, 2, 3))
-                valid_length = F.reshape(valid_length, (-1, 1, 1))
-                valid_length_vector = F.cast(self.equal(valid_length, self.range), self.dtype)
+                                                                    0)).astype(mstype.float32), (1, 2, 3))
+                valid_length = valid_length.reshape((-1, 1, 1))
+                valid_length_vector = (self.equal(valid_length, self.range)).astype(self.dtype)
                 # Pad the key and value to seq_length with only the position index not zero
                 current_key = self.mul1(self.tile(key, (1, 1, 1, self.seq_length)),
                                         self.expand_dims(valid_length_vector, 2))
@@ -340,7 +330,7 @@ class BloomAttention(Cell):
                 # Update key_present and value_present for state update
                 key_present = key
                 value_present = value
-                attention_mask = F.reshape(self.attention_mask, (self.seq_length, self.seq_length, 1, 1))
+                attention_mask = self.attention_mask.reshape((self.seq_length, self.seq_length, 1, 1))
 
         layer_present = (key_present, value_present)
         # multi head attention considering attention mask
@@ -349,16 +339,16 @@ class BloomAttention(Cell):
         # Output
         output = self.projection(attention)
         output = self.dropout(output)
-        output = F.reshape(output, ori_shape)
-        output = F.cast(output, ori_dtype)
+        output = output.reshape(ori_shape)
+        output = output.astype(ori_dtype)
         return output, layer_present
 
     def _get_batch_size_from_query(self, query):
         r"""Get the batch size from query tensor"""
         # For the incremental prediction, the seq length for the input is 1.
-        if len(F.shape(query)) == 2 and ((self.use_past and self.is_first_iteration) or (not self.use_past)):
-            return F.shape(query)[0] // self.src_seq_length
-        return F.shape(query)[0]
+        if query.ndim == 2 and ((self.use_past and self.is_first_iteration) or (not self.use_past)):
+            return query.shape[0] // self.src_seq_length
+        return query.shape[0]
 
     def _get_seq_length_under_incremental(self, length):
         r"""Return the length of the tensor.
@@ -371,11 +361,11 @@ class BloomAttention(Cell):
     def _check_inputs(self, query_tensor, key_tensor, value_tensor, attention_mask, key_past=None,
                       value_past=None, batch_valid_length=None):
         r"""Check inputs"""
-        _check_input_dtype(F.dtype(query_tensor), "query_tensor", [mstype.float32, mstype.float16], self.cls_name)
-        _check_input_dtype(F.dtype(key_tensor), "key_tensor", [mstype.float32, mstype.float16], self.cls_name)
-        _check_input_dtype(F.dtype(value_tensor), "value_tensor", [mstype.float32, mstype.float16], self.cls_name)
+        _check_input_dtype(query_tensor.dtype, "query_tensor", [mstype.float32, mstype.float16], self.cls_name)
+        _check_input_dtype(key_tensor.dtype, "key_tensor", [mstype.float32, mstype.float16], self.cls_name)
+        _check_input_dtype(value_tensor.dtype, "value_tensor", [mstype.float32, mstype.float16], self.cls_name)
         if attention_mask is not None:
-            _check_input_dtype(F.dtype(attention_mask), "attention_mask", [mstype.float32, mstype.float16],
+            _check_input_dtype(attention_mask.dtype, "attention_mask", [mstype.float32, mstype.float16],
                                self.cls_name)
 
         key_is_tensor = isinstance(key_past, Tensor)
@@ -391,19 +381,19 @@ class BloomAttention(Cell):
         _check_past_none_input_none(self.use_past, "batch_valid_length", self.cls_name, None,
                                     batch_valid_length_is_tensor, batch_is_default)
         if self.use_past:
-            _check_input_dtype(F.dtype(key_past), "key_past", [mstype.float16], self.cls_name)
-            _check_input_dtype(F.dtype(value_past), "value_past", [mstype.float16], self.cls_name)
-            _check_input_dtype(F.dtype(batch_valid_length), "batch_valid_length", [mstype.int32], self.cls_name)
+            _check_input_dtype(key_past.dtype, "key_past", [mstype.float16], self.cls_name)
+            _check_input_dtype(value_past.dtype, "value_past", [mstype.float16], self.cls_name)
+            _check_input_dtype(batch_valid_length.dtype, "batch_valid_length", [mstype.int32], self.cls_name)
         return True
 
     def _convert_to_2d_tensor(self, query_tensor, key_tensor, value_tensor):
         """convert a nd tensor to a 2d tensor"""
-        query_shape = F.shape(query_tensor)
-        query_tensor = F.reshape(query_tensor, (-1, query_shape[-1]))
-        key_shape = F.shape(key_tensor)
-        key_tensor = F.reshape(key_tensor, (-1, key_shape[-1]))
-        value_shape = F.shape(value_tensor)
-        value_tensor = F.reshape(value_tensor, (-1, value_shape[-1]))
+        query_shape = query_tensor.shape
+        query_tensor = query_tensor.reshape((-1, query_shape[-1]))
+        key_shape = key_tensor.shape
+        key_tensor = key_tensor.reshape((-1, key_shape[-1]))
+        value_shape = value_tensor.shape
+        value_tensor = value_tensor.reshape((-1, value_shape[-1]))
 
         return query_tensor, key_tensor, value_tensor
 
@@ -419,9 +409,9 @@ class BloomAttention(Cell):
         """
         x = self.merger_head_transpose(
             x, (0, 2, 1, 3))  # bs, seq_length, head, size_per_head
-        x_shape = P.Shape()(x)
+        x_shape = x.shape
         new_shape = (-1, x_shape[-2] * x_shape[-1])
-        x_merge = self.reshape(x, new_shape)
+        x_merge = x.reshape(new_shape)
         return x_merge
 
     def _softmax(self, attention_scores):
@@ -434,12 +424,11 @@ class BloomAttention(Cell):
         if self._is_ascend and self.softmax_dtype == mstype.float16 or not self._is_ascend:
             attention_probs = self.softmax(attention_scores)
         else:
-            shape = F.shape(attention_scores)
+            shape = attention_scores.shape
             # attention probs
             attention_probs = self.softmax_3d(
-                F.reshape(attention_scores,
-                          (shape[0], -1, shape[-1])))
-            attention_probs = F.reshape(attention_probs, shape)
+                attention_scores.reshape((shape[0], -1, shape[-1])))
+            attention_probs = attention_probs.reshape(shape)
         return attention_probs
 
     def _attn(self, query, key, value, alibi_tensor, attention_mask):
@@ -473,28 +462,28 @@ class BloomAttention(Cell):
         if attention_mask is not None:
             if self.use_past and not self.is_first_iteration:
                 # Calculate the current total token
-                current_index = self.reducesum(F.cast(self.not_equal(self.slice(key, (0, 0, 0, 0),
-                                                                                (F.shape(query)[0], 1, 1,
+                current_index = self.reducesum((self.not_equal(self.slice(key, (0, 0, 0, 0),
+                                                                                (query.shape[0], 1, 1,
                                                                                  self.seq_length),
                                                                                 (1, 1, 1, 1)),
-                                                                     0), mstype.float32), (1, 2, 3))
+                                                                     0)).astype(mstype.float32), (1, 2, 3))
                 # Get the precise position index
-                index = self.sub1(F.cast(current_index, mstype.int32), 1)
-                index = F.reshape(index, (-1, 1, 1))
+                index = self.sub1(current_index.astype(mstype.int32), 1)
+                index = index.reshape((-1, 1, 1))
                 # Calculate the attention_mask matrix via the position index
-                attention_mask = F.cast(self.tensor_le(self.range, index), mstype.int32)
+                attention_mask = (self.tensor_le(self.range, index)).astype(mstype.int32)
                 attention_mask = self.expand_dims(attention_mask, 2)
             # Minus 10000 for the position where masked to exclude them from softmax
             multiplu_out = self.sub(
-                P.Cast()(F.tuple_to_array((1.0,)), P.DType()(attention_scores)),
-                P.Cast()(attention_mask, P.DType()(attention_scores)))
+                Tensor((1.0,)).astype(attention_scores.dtype),
+                attention_mask.astype(attention_scores.dtype))
 
             adder = self.mul(multiplu_out, self.multiply_data)
             attention_scores = self.add(adder, attention_scores)
 
         # attention probs
         attention_probs = self._softmax(attention_scores)
-        attention_probs = P.Cast()(attention_probs, ori_dtype)
+        attention_probs = attention_probs.astype(ori_dtype)
 
         attention_probs = self.prob_dropout(attention_probs)
         # Weighted sum output [bs, num_heads, seq_length, size_per_head]
@@ -684,13 +673,13 @@ class BloomBlock(Cell):
     def construct(self, x, alibi_tensor, input_mask=None, init_reset=True, batch_valid_length=None):
         """forward process"""
         self._check_input(x, input_mask, init_reset, batch_valid_length)
-        x_shape = F.shape(x)
-        x = F.reshape(x, (-1, x_shape[-1]))
+        x_shape = x.shape
+        x = x.reshape((-1, x_shape[-1]))
         if self.post_layernorm_residual:
             input_x = x
         else:
             input_x = self.layernorm1(x)
-        input_x = F.cast(input_x, self.dtype)
+        input_x = input_x.astype(self.dtype)
 
         # indicate whether reset saved states
         key_reset = None
@@ -698,13 +687,13 @@ class BloomBlock(Cell):
 
         if self.use_past:
             # reset states, init_reset True for reuse and False for reset
-            self.assign(self.key_past, self.mul(self.key_past, F.cast(init_reset, self.dtype)))
+            self.assign(self.key_past, self.mul(self.key_past, init_reset.astype(self.dtype)))
             key_reset = self.key_past
-            self.assign(self.value_past, self.mul(self.value_past, F.cast(init_reset, self.dtype)))
+            self.assign(self.value_past, self.mul(self.value_past, init_reset.astype(self.dtype)))
             value_reset = self.value_past
             # add dependency for desired execution order
-            input_x = F.depend(input_x, key_reset)
-            input_x = F.depend(input_x, value_reset)
+            input_x = ops.depend(input_x, key_reset)
+            input_x = ops.depend(input_x, value_reset)
 
         attention, layer_present = self.attention(input_x, input_x, input_x, alibi_tensor, input_mask,
                                                   self.key_past, self.value_past, batch_valid_length)
@@ -716,7 +705,7 @@ class BloomBlock(Cell):
             x = self.add(x, attention)
 
         output_x = self.layernorm2(x)
-        output_x = F.cast(output_x, self.dtype)
+        output_x = output_x.astype(self.dtype)
         aux_loss = None
         if self.use_moe:
             mlp_logit, aux_loss = self.output(output_x)
@@ -734,24 +723,24 @@ class BloomBlock(Cell):
             self.assign(self.value_past, value_present)
             value_update = self.value_past
             # add dependency for desired execution order
-            key_update = F.depend(key_update, key_reset)
-            value_update = F.depend(value_update, value_reset)
+            key_update = ops.depend(key_update, key_reset)
+            value_update = ops.depend(value_update, value_reset)
 
         # add dependency for desired execution order
-        mlp_logit = F.depend(mlp_logit, value_update)
-        mlp_logit = F.depend(mlp_logit, key_update)
+        mlp_logit = ops.depend(mlp_logit, value_update)
+        mlp_logit = ops.depend(mlp_logit, key_update)
 
         # if shape is 3d, we reshape the inputs of the add
         if len(x_shape) == 3:
-            output_x = P.Reshape()(output_x, x_shape)
-            mlp_logit = P.Reshape()(mlp_logit, x_shape)
-            x = P.Reshape()(x, x_shape)
+            output_x = output_x.reshape(x_shape)
+            mlp_logit = mlp_logit.reshape(x_shape)
+            x = x.reshape(x_shape)
 
             if self.post_layernorm_residual:
                 output = self.add_3d(output_x, mlp_logit)
-                output = F.reshape(output, (-1, x_shape[-1]))
+                output = output.reshape((-1, x_shape[-1]))
                 output = self.layernorm1(output)
-                output = F.reshape(output, x_shape)
+                output = output.reshape(x_shape)
             else:
                 output = self.add_3d(x, mlp_logit)
         else:
@@ -760,7 +749,7 @@ class BloomBlock(Cell):
                 output = self.layernorm1(output)
             else:
                 output = self.add(x, mlp_logit)
-            output = F.reshape(output, x_shape)
+            output = output.reshape(x_shape)
 
         if self.use_moe:
             return output, layer_present, aux_loss
@@ -768,9 +757,9 @@ class BloomBlock(Cell):
 
     def _check_input(self, x, input_mask, init_reset, batch_valid_length):
         r"""Check inputs"""
-        _check_input_dtype(F.dtype(x), "x", [mstype.float32, mstype.float16], self.cls_name)
+        _check_input_dtype(x.dtype, "x", [mstype.float32, mstype.float16], self.cls_name)
         if input_mask is not None:
-            _check_input_dtype(F.dtype(input_mask), "input_mask", [mstype.float32, mstype.float16], self.cls_name)
+            _check_input_dtype(input_mask.dtype, "input_mask", [mstype.float32, mstype.float16], self.cls_name)
 
         init_reset_is_tensor = isinstance(init_reset, Tensor)
         init_reset_is_default = init_reset is True
@@ -782,8 +771,8 @@ class BloomBlock(Cell):
                                     batch_valid_length_is_tensor, batch_is_default)
 
         if self.use_past:
-            _check_input_dtype(F.dtype(init_reset), "init_reset", [mstype.bool_], self.cls_name)
-            _check_input_dtype(F.dtype(batch_valid_length), "batch_valid_length", [mstype.int32], self.cls_name)
+            _check_input_dtype(init_reset.dtype, "init_reset", [mstype.bool_], self.cls_name)
+            _check_input_dtype(batch_valid_length.dtype, "batch_valid_length", [mstype.int32], self.cls_name)
         return True
 
 
