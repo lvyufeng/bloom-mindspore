@@ -190,8 +190,7 @@ class BloomModel(nn.Cell):
 
         for i in range(self.num_layers):
             hidden_states, _ = self.blocks[i](hidden_states, alibi_tensor, causal_mask)
-        #     break
-        # return (hidden_states, hidden_states)
+
         output_state = self.ln_f(hidden_states)
 
         return output_state, embedding_table
@@ -222,13 +221,12 @@ class BloomHead(nn.Cell):
                 copied_parallel_config.model_parallel, 1)))
         self.hidden_size = hidden_size
         self.dtype = compute_type
-        self.cast = P.Cast()
-        self.reshape = P.Reshape()
 
     def construct(self, state, embedding_table):
-        state = self.reshape(state, (-1, self.hidden_size))
-        logits = self.matmul(self.cast(state, self.dtype), self.cast(embedding_table, self.dtype))
-        return logits
+        ori_dtype = state.dtype
+        state = state.reshape((-1, self.hidden_size))
+        logits = self.matmul(state.astype(self.dtype), embedding_table.astype(self.dtype))
+        return logits.astype(ori_dtype)
 
 
 class BloomLMHeadModel(BaseModel):
@@ -250,13 +248,13 @@ class BloomLMHeadModel(BaseModel):
         self.stridedslice = P.StridedSlice().shard(((parallel_config.data_parallel, 1),))
         self.not_equal = P.NotEqual().shard(((parallel_config.data_parallel, 1), ()))
 
-        self.backbone = BloomModel(self.config)
+        self.transformer = BloomModel(self.config)
         self.head = BloomHead(hidden_size=config.hidden_size,
                             vocab_size=config.vocab_size,
                             parallel_config=self.config.parallel_config)
         if parallel_config.pipeline_stage > 1:
             self.head.pipeline_stage = parallel_config.pipeline_stage - 1
-            self.backbone.embedding.word_embedding.embedding_table.add_pipeline_stage(self.head.pipeline_stage)
+            self.transformer.embedding.word_embedding.embedding_table.add_pipeline_stage(self.head.pipeline_stage)
 
         mp = config.parallel_config.model_parallel
         vocab_size = config.vocab_size
@@ -268,8 +266,6 @@ class BloomLMHeadModel(BaseModel):
             loss_parallel_config.model_parallel = 1
 
         self.loss = CrossEntropyLoss(parallel_config=loss_parallel_config)
-        self.reshape = P.Reshape()
-        self.cast = P.Cast()
         self.load_checkpoint(config)
 
     def construct(self, input_ids):
@@ -291,18 +287,18 @@ class BloomLMHeadModel(BaseModel):
         else:
             tokens = input_ids
 
-        input_mask = self.cast(self.not_equal(tokens, self.eos_token), mstype.float32)
+        input_mask = self.not_equal(tokens, self.eos_token).astype(mstype.float32)
 
         # [batch_size, seq_length, vocab_size]
-        output_states, embedding_table = self.backbone(tokens, input_mask)
+        output_states, embedding_table = self.transformer(tokens, input_mask)
         logits = self.head(output_states, embedding_table)
 
         if self.phase != 'train':
             return logits
 
         labels = self.stridedslice(input_ids, (0, 1), (batch_size, seq_length), (1, 1))
-        labels = self.reshape(labels, (-1,))
-        input_mask = self.reshape(input_mask, (-1,))
+        labels = labels.reshape((-1,))
+        input_mask = input_mask.reshape((-1,))
         loss = self.loss(logits, labels, input_mask)
         return loss
 

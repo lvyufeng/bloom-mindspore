@@ -7,7 +7,6 @@ from mindspore import nn, ops
 from mindspore import context
 import mindspore.common.dtype as mstype
 from mindspore.ops import operations as P
-# from mindspore.ops import functional as F
 from mindspore.nn.cell import Cell
 try:
     from mindspore._checkparam import Validator
@@ -25,7 +24,6 @@ from mindformers.modules.transformer.moe import default_moe_config, MoE, _check_
 from mindformers.modules.transformer import FeedForward
 from mindformers.modules.transformer.transformer import default_transformer_config, _get_lambda_func
 from .nn import Linear, Dropout
-# from .nn import Dropout
 
 class BloomAttention(Cell):
     def __init__(self, batch_size,

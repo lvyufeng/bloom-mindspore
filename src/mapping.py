@@ -10,6 +10,10 @@ def layer_name_mapping(key):
     
     return: split, new_name
     """
+    prefix = ''
+    if 'transformer' in key:
+        prefix = 'transformer.'
+        key = key.replace('transformer.', '')
     # Handle first and last layers
     layer_rename_map = {
         "word_embeddings.weight": "embedding.word_embeddings.embedding_table",
@@ -29,11 +33,13 @@ def layer_name_mapping(key):
         "mlp.dense_h_to_4h.bias": "output.mapping.bias",
         "mlp.dense_4h_to_h.weight": "output.projection.weight",
         "mlp.dense_4h_to_h.bias": "output.projection.bias",
+        "lm_head.weight": "head.weight",
+        "lm_head.bias": "head.bias",
     }
 
     split = False
     if key in layer_rename_map:
-        return split, layer_rename_map[key]
+        return split, prefix + layer_rename_map[key]
 
     # Handle transformer blocks
     match = re.match(r'^\w*\.(\d+)\.(\w+\.\w+\.\w+|\w+\.\w+)$', key)
@@ -41,7 +47,7 @@ def layer_name_mapping(key):
     text = match.group(2)
     if "self_attention.query_key_value" in key:
         split = True
-    return split, f"blocks.{layer_number}." + layer_rename_map[text]
+    return split, f"{prefix}blocks.{layer_number}." + layer_rename_map[text]
 
 def hf_to_ms(hf_weights, config):
     ms_params = {}
