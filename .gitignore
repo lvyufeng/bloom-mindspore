@@ -131,3 +131,5 @@ configs/
 
 output/
 rank_*/
+*.bin
+*.ckpt

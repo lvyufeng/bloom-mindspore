@@ -1,8 +1,7 @@
+import torch
 import mindspore
 from mindspore import Tensor, Parameter
-from transformers import AutoModel
-from src.configuration_bloom import BloomConfig
-from src.modeling_bloom import BloomModel
+from transformers import AutoConfig
 import re
 
 def layer_name_mapping(key):
@@ -10,6 +9,10 @@ def layer_name_mapping(key):
     
     return: split, new_name
     """
+    prefix = ''
+    if 'transformer' in key:
+        prefix = 'transformer.'
+        key = key.replace('transformer.', '')
     # Handle first and last layers
     layer_rename_map = {
         "word_embeddings.weight": "embedding.word_embeddings.embedding_table",
@@ -29,11 +32,13 @@ def layer_name_mapping(key):
         "mlp.dense_h_to_4h.bias": "output.mapping.bias",
         "mlp.dense_4h_to_h.weight": "output.projection.weight",
         "mlp.dense_4h_to_h.bias": "output.projection.bias",
+        "lm_head.weight": "head.weight",
+        "lm_head.bias": "head.bias",
     }
 
     split = False
     if key in layer_rename_map:
-        return split, layer_rename_map[key]
+        return split, prefix + layer_rename_map[key]
 
     # Handle transformer blocks
     match = re.match(r'^\w*\.(\d+)\.(\w+\.\w+\.\w+|\w+\.\w+)$', key)
@@ -41,39 +46,74 @@ def layer_name_mapping(key):
     text = match.group(2)
     if "self_attention.query_key_value" in key:
         split = True
-    return split, f"blocks.{layer_number}." + layer_rename_map[text]
+    return split, f"{prefix}blocks.{layer_number}." + layer_rename_map[text]
 
-
-hf_bloom = AutoModel.from_pretrained('bigscience/bigscience-small-testing')
-
-# convert hf ckpt to ms
-print(hf_bloom.config)
-hf_weights = hf_bloom.state_dict()
-
-ms_params = {}
-for k, v in hf_weights.items():
-    print(k, v.shape, v.dtype)
-    split, new_name = layer_name_mapping(k)
-    if split:
-        v_list = v.tensor_split(3)
-        for i in range(1, 4):
-            tmp_name = new_name.format(i)
-            tmp_tensor = Tensor(v_list[i-1].numpy(), mindspore.float32)
-            ms_params[tmp_name] = Parameter(tmp_tensor, name=tmp_name)
-    else:
-        if ('projection' in new_name or 'mapping' in new_name) and 'weight' in new_name:
-            new_tensor = Tensor(v.transpose(0, 1).numpy(), mindspore.float32)
+def hf_to_ms(hf_weights, config, ms_dtype=mindspore.float32, for_save=False):
+    ms_params = {}
+    for k, v in hf_weights.items():
+        print(k, v.shape, v.dtype)
+        split, new_name = layer_name_mapping(k)
+        if split:
+            if 'weight' in new_name:
+                v = v.reshape(config.n_head, 3, config.hidden_size // config.n_head, v.shape[-1])
+                v_list = v.tensor_split(3, dim=1)
+                for i in range(1, 4):
+                    tmp_name = new_name.format(i)
+                    print(v_list[i-1].shape)
+                    tmp_tensor = Tensor(v_list[i-1].reshape(-1, v_list[i-1].shape[-1]).float().numpy(), ms_dtype)
+                    ms_params[tmp_name] = Parameter(tmp_tensor, name=tmp_name)
+            else:
+                v = v.reshape(config.n_head, 3, config.hidden_size // config.n_head)
+                v_list = v.tensor_split(3, dim=1)
+                for i in range(1, 4):
+                    tmp_name = new_name.format(i)
+                    print(v_list[i-1].shape)
+                    tmp_tensor = Tensor(v_list[i-1].reshape(-1).float().numpy(), ms_dtype)
+                    # if 'weight' in new_name:
+                    #     tmp_tensor = tmp_tensor.swapaxes(0, 1)
+                    ms_params[tmp_name] = Parameter(tmp_tensor, name=tmp_name)
         else:
-            new_tensor = Tensor(v.numpy(), mindspore.float32)
-        ms_params[new_name] = Parameter(new_tensor, name=new_name)
+            if ('projection' in new_name or 'mapping' in new_name) and 'weight' in new_name:
+                new_tensor = Tensor(v.transpose(0, 1).float().numpy(), ms_dtype)
+            else:
+                new_tensor = Tensor(v.float().numpy(), ms_dtype)
+            ms_params[new_name] = Parameter(new_tensor, name=new_name)
 
-ms_config = BloomConfig(hidden_size=64, num_heads=8, num_layers=2, seq_length=20)
-ms_bloom = BloomModel(ms_config)
+    if for_save:
+        return [{'name':k, 'data':v} for k,v in ms_params.items()]
 
+    return ms_params
 
-for k, v in ms_bloom.parameters_and_names():
-    print(k, v.shape, v.dtype)
+def process_hf_shard_files(file_list, config, save_dir=None, combine=False, ms_dtype=mindspore.float32):
+    combine_params = []
+    for file in file_list:
+        pt_states = torch.load(file, map_location='cpu')
+        ms_params = hf_to_ms(pt_states, config, ms_dtype, True)
+        if combine:
+            combine_params.extend(ms_params)
+        else:
+            save_file = save_dir + '/' + file.split('/')[-1] if save_dir else file + '.ckpt'
+            mindspore.save_checkpoint(ms_params, save_file)
 
-not_loaded = mindspore.load_param_into_net(ms_bloom, ms_params)
+        del pt_states
+        del ms_params
 
-pass
+    if combine:
+        path = save_dir + '/' + 'combine.ckpt' if save_dir else \
+            '/'.join(file.split('/')[:-1]) + 'combine.ckpt'
+        mindspore.save_checkpoint(combine_params, save_dir)
+
+def hf_combined_to_ms(src_dir, dst_dir, ckpt_prefix, out_strategy):
+    # src strategy is None since hf ckpt is not shard for mp or pp.
+    mindspore.transform_checkpoints(src_dir, dst_dir,
+                                    ckpt_prefix=ckpt_prefix,
+                                    src_strategy_file=None,
+                                    dst_strategy_file=out_strategy)
+
+if __name__ == '__main__':
+    config = AutoConfig.from_pretrained('bigscience/bigscience-small-testing')
+
+    print(config)
+    # convert hf ckpt to ms
+    process_hf_shard_files(['pytorch_model.bin'], config, ms_dtype=mindspore.float16)
+    process_hf_shard_files(['pytorch_model.bin'], config, combine=True)
